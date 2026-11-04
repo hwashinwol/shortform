@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>정보 전달형 AI숏폼 영상 제작</title>
+    <style>
+        body {font-family : 'Malgun Gothic', sans-serif; background: #080812; color : white; text-align : center; padding-top : 100px;}
+        h1 {color : #00c88c; }
+        input {padding : 15px; font-size : 18px; width : 400px; border-radius : 8px; border : none; outline : none;}
+        button {padding : 15px 30px; font-size : 18px; cursor : pointer; background : #ffff00; border : none; border-radius : 8px; font-weight : bold; margin-left : 10px; }
+        #loading {display : none; margin-top : 30px; font-size : 20px; color : #00c88c; }
+    </style>
+</head>
+<body>
+    <h1>인포그래피 구조 AI숏폼 자동 생성기</h1>
+    <p>주제를 입력하면 AI가 대본, 디자인, 음성을 자동 생성하여 영상을 생성하고 다운로드합니다</p>
+
+    <!-- 파이썬의 /generate 라우터로 키워드를 전송 -->
+    <form action = "/generate" method = "POST" onsubmit = "document.getElementById('loading').style.display='block';">
+        <input type = "text" name = "keyword" placeholder = "예 : 청년고용연계자금" required>
+        <button type = 'submit'>영상 렌더링</button>
+    </form>
+
+    <div id = "loading">
+        렌더링 중입니다...(대본 작성 -> HTML 디자인 -> 음성 합성 -> 영상 인코딩)<br>
+        약 30초 ~ 1분 정도 소요되니 창을 닫지 말고 대기해 주세요. 
+    </div>
+</body>
+</html>
