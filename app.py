@@ -1,12 +1,13 @@
 import os
-import json
+import re
 import time
+import html
 import asyncio
 import datetime
-import requests
-import urllib.parse
+import pathlib
 import edge_tts
-from PIL import Image, ImageDraw, ImageFont
+from typing import List
+from pydantic import BaseModel
 from html2image import Html2Image
 from dotenv import load_dotenv
 from google import genai
@@ -14,47 +15,77 @@ from google.genai import types
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 from flask import Flask, render_template, request, send_file
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WIDTH, HEIGHT = 1080, 1920
+
 app = Flask(__name__)
 
 # app.py 와 같은 폴더의 .env 파일에서 API 키 읽기
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 gemini_api_key = os.environ.get('GEMINI_API_KEY', '').strip()
 if not gemini_api_key:
     raise SystemExit('GEMINI_API_KEY가 없습니다. shortform 폴더의 .env 파일을 확인하세요.')
 client = genai.Client(api_key = gemini_api_key)
 
-# 크롬 스크린샷 도구 초기화
-hti = Html2Image(size = (1080, 1920))
+# 크롬 스크린샷 도구 초기화 (HTML 씬을 1080x1920 PNG로 캡처)
+hti = Html2Image(size = (WIDTH, HEIGHT), output_path = BASE_DIR)
+
+
+# ---------------------------------------------------------------------------
+# 1. Gemini : 대본 + 씬별 레이아웃/내용 생성
+#    (디자인은 아래 고정 CSS 템플릿이 담당하고, Gemini는 레이아웃 종류와 문구만 고른다)
+# ---------------------------------------------------------------------------
+LAYOUTS = ('hero', 'cards', 'steps', 'stat', 'cta')
+
+class Item(BaseModel):
+    title: str
+    desc: str
+    badge: str
+
+class Scene(BaseModel):
+    layout: str      # hero | cards | steps | stat | cta
+    kicker: str      # 타이틀 위 작은 라벨 (없으면 "")
+    title: str
+    subtitle: str
+    items: List[Item]
+    stat_value: str  # stat 레이아웃의 큰 숫자 (예 : 7천만 원)
+    stat_label: str
+    cta_title: str   # 하단 강조 버튼 (없으면 "")
+    cta_desc: str
+    tip: str         # 하단 한 줄 팁 (없으면 "")
+    voice: str
+
+class Script(BaseModel):
+    scenes: List[Scene]
+
 
 def generate_dynamic_script_and_design(keyword, max_retries = 5):
-    """LLM이 대본도 생성화고 매 씬의 UI/UX 레이아웃도 HTML/CSS로 디자인하여 반환""" 
+    """LLM이 대본과 씬별 인포그래픽 구성(레이아웃 + 문구)을 생성하여 반환"""
     current_year = datetime.datetime.now().year
     system_instruction = f"""
-    당신은 숏폼 인포그래픽 디자이너이자 기획자입니다. 
-    현재 연도는 {current_year}년입니다. 대본이나 화면 텍스트에 연도가 들어갈 경우 반드시 최신 연도({current_year}년)를 반영하세요.
-    주어진 주제를 3~4개의 씬으로 나누고, 화면 디자인은 HTML이 아닌 AI이미지 생성용 '영문 프롬프트'로 지시합니다. 
+    당신은 정책자금/지원금 정보를 다루는 숏폼 인포그래픽 기획자입니다.
+    현재 연도는 {current_year}년입니다. 연도가 들어갈 경우 반드시 {current_year}년을 반영하세요.
+    주어진 주제를 4~6개의 씬으로 나누고, 씬마다 아래 레이아웃 중 하나를 골라 화면 문구를 채웁니다.
 
-    [디자인 필수 규칙]
-    1. image_prompt : 9:16 세로형 다크모드 배경을 묘사하는 디테일한 영문 프롬프트(예 : Dark mode abstract background, glowing neon cyan geometric lines, 9:16 vertical)
-    2. 화면 텍스트(screen_title, screen desc)에는 큰따옴표나 복잡한 기호를 빼고 핵심만 적으세요.
+    [레이아웃 종류]
+    - hero  : 첫 씬 전용. kicker(예 : {current_year} 정책자금), 큰 title, subtitle. items는 비움.
+    - cards : 핵심 혜택/조건 정리. items 2~3개(title, desc, badge 모두 채움).
+    - steps : 신청 절차. items 3개(title=단계명, desc=구체적 행동, badge=""). 필요하면 cta_title/cta_desc.
+    - stat  : 한도/금리 같은 핵심 숫자 강조. stat_value(예 : 최대 7천만 원), stat_label, items 0~2개.
+    - cta   : 마지막 씬. title, subtitle, cta_title(행동 유도 문구), cta_desc.
+    첫 씬은 hero, 마지막 씬은 cta로 하고, 중간 씬은 같은 레이아웃이 연속되지 않게 섞으세요.
+
+    [화면 문구 규칙]
+    1. title은 14자 이내, subtitle은 24자 이내, item title은 14자 이내, item desc는 26자 이내, badge는 6자 이내.
+    2. 문구는 명사형으로 짧게 끝내고 큰따옴표나 이모지는 쓰지 마세요.
+    3. 쓰지 않는 필드는 빈 문자열 "" 또는 빈 배열 []로 두세요.
+    4. 확실하지 않은 수치는 지어내지 말고 "공고 확인" 처럼 표현하세요.
 
     [TTS 대본(voice) 작성 규칙]
     1. "첫 번째 씬에서는~", "이 화면은 ~을 설명합니다" 같은 상황 설명이나 지시문은 절대 넣지 마세요.
-    2. 시청자에게 직접 말을 건네는 '구어체 내레이션' 대본만 즉시 시작하세요(예 : "혹시 일시적 경영 애로 자금이라고 들어보셨나요? 지금부터 신청 방법을 알려드리겠습니다." 등)
-    3. '청년고용연계자금'이나 '소상공인대리대출' 같은 복합 명사나 전문 용어는 TTS가 어색하게 읽지 않도록 반드시 자연스럽게 띄어쓰기를 포함하여 대본(voice)을 작성하세요.(예 : '청년 고용 연계 자금', '소상공인 대리 대출')
-
-    반드시 아래 JSON 형식으로 응답하세요.
-    {{
-        "scenes": [
-            {{
-                "image_prompt": "영문 배경 프롬프트",
-                "screen_title": "메인 타이틀 텍스트",
-                "screen_desc": "서브 설명 텍스트",
-                "voice": "TTS가 읽을 순수 내레이션 구어체 대본"
-            }}
-        ]
-    }}
+    2. 시청자에게 직접 말을 건네는 구어체 내레이션만 쓰세요. 씬당 1~3문장.
+    3. '청년고용연계자금' 같은 복합 명사는 TTS가 자연스럽게 읽도록 띄어쓰기하세요.(예 : '청년 고용 연계 자금')
     """
 
     for attempt in range(max_retries):
@@ -65,77 +96,195 @@ def generate_dynamic_script_and_design(keyword, max_retries = 5):
                 config = types.GenerateContentConfig(
                     system_instruction = system_instruction,
                     response_mime_type = 'application/json',
+                    response_schema = Script,
                 )
             )
-            raw_text = response.text.strip()
-            if raw_text.startswith("```json"): raw_text = raw_text[7:]
-            if raw_text.startswith("```"): raw_text = raw_text[3:]
-            if raw_text.endswith("```"): raw_text = raw_text[:-3]
-            return json.loads(raw_text.strip())
+            script = response.parsed
+            if script is None:
+                script = Script.model_validate_json(response.text)
+            if not script.scenes:
+                raise ValueError('씬이 비어 있습니다')
+            return script.model_dump()
         except Exception as e:
             print(f"Gemini 호출 실패, 3초 후 재시도 ({attempt+1}/{max_retries}) : {e}")
             time.sleep(3)
     raise Exception('Gemini API 호출 실패')
 
-def create_scene_visuals(prompt, title, desc, output_path):
-    """Pollinations.ai로 무료 배경 생성 후 파이썬으로 텍스트 오버레이"""
-    # 1. 프롬프트를 URL용으로 인코딩하여 Pollinations API 호출(nologo=true 로 워터마크 제거 시도)
-    encoded_prompt = urllib.parse.quote(prompt)
-    url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1080&height=1920&nologo=true"
 
-    response = requests.get(url)
-    if response.status_code == 200:
-        with open(output_path, 'wb') as f:
-            f.write(response.content)
-    else:
-        # 통신 실패 시 검은 배경 생성
-        img = Image.new('RGB', (1080,1920), color = (20,20,30))
-        img.save(output_path)
+# ---------------------------------------------------------------------------
+# 2. 씬 → HTML 인포그래픽 → PNG
+# ---------------------------------------------------------------------------
+def _font_url(filename):
+    return pathlib.Path(BASE_DIR, filename).as_uri()
 
-    # 2. Pillow로 다크 반투명 박스 및 텍스트 합성
-    img = Image.open(output_path).convert('RGBA').resize((1080, 1920))
-    overlay = Image.new('RGBA', img.size, (255,255,255,0))
-    draw = ImageDraw.Draw(overlay)
+BASE_CSS = f"""
+@font-face {{ font-family: 'Gmarket'; font-weight: 300; src: url('{_font_url('GmarketSansTTFLight.ttf')}'); }}
+@font-face {{ font-family: 'Gmarket'; font-weight: 500; src: url('{_font_url('GmarketSansTTFMedium.ttf')}'); }}
+@font-face {{ font-family: 'Gmarket'; font-weight: 700; src: url('{_font_url('GmarketSansTTFBold.ttf')}'); }}
 
-    try:
-        font_title = ImageFont.truetype('GmarketSansTTFBold.ttf', 90)
-        font_desc = ImageFont.truetype('GmarketSansTTFLight.ttf', 60)
-    except:
-        print('폰트를 찾을 수 없어 기본 폰트로 고정합니다')
-        font_title = font_desc = ImageFont.load_default()
+:root {{
+    --bg: #080c14;
+    --card: rgba(255,255,255,0.045);
+    --line: rgba(34,211,238,0.28);
+    --line-soft: rgba(255,255,255,0.09);
+    --text: #ffffff;
+    --sub: #9aa8bd;
+    --accent: #22d3ee;
+    --accent2: #38bdf8;
+}}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+html, body {{ width: {WIDTH}px; height: {HEIGHT}px; overflow: hidden; }}
+body {{
+    font-family: 'Gmarket', 'Malgun Gothic', sans-serif;
+    color: var(--text);
+    background:
+        radial-gradient(900px 700px at 85% 8%, rgba(34,211,238,0.10), transparent 70%),
+        radial-gradient(800px 800px at 0% 100%, rgba(56,189,248,0.08), transparent 70%),
+        var(--bg);
+    word-break: keep-all;
+}}
+/* 숏폼 UI(하단 자막/버튼)에 가리지 않도록 위아래 안전 여백 */
+.frame {{ position: absolute; inset: 150px 90px 330px 90px; display: flex; flex-direction: column; }}
+.middle {{ flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 36px; }}
 
-    # 가독성을 위한 반투명 박스(중앙 정렬)
-    draw.rounded_rectangle([90,700,990,1220], radius = 40, fill = (10,15,25,220))
+.kicker {{
+    align-self: flex-start; font-size: 38px; font-weight: 500; color: var(--accent);
+    border: 2px solid var(--line); background: rgba(34,211,238,0.08);
+    padding: 16px 30px; border-radius: 999px; margin-bottom: 40px;
+}}
+.title {{ font-size: 96px; font-weight: 700; line-height: 1.22; letter-spacing: -2px; }}
+.title.center, .subtitle.center {{ text-align: center; }}
+.subtitle {{ font-size: 44px; font-weight: 500; color: var(--sub); margin-top: 26px; line-height: 1.4; }}
+.accent {{ color: var(--accent); }}
 
-    # 박스 폭(좌우 여백 포함 약 820px)에 맞게 줄바꿈
-    def wrap_text(text, font, max_width):
-        lines, line = [], ''
-        for word in text.split():
-            candidate = f"{line} {word}" if line else word
-            if draw.textlength(candidate, font = font) <= max_width:
-                line = candidate
-                continue
-            if line:
-                lines.append(line)
-            # 한 단어가 박스보다 길면 글자 단위로 자름
-            line = ''
-            for ch in word:
-                if draw.textlength(line + ch, font = font) <= max_width:
-                    line += ch
-                else:
-                    lines.append(line)
-                    line = ch
-        if line:
-            lines.append(line)
-        return '\n'.join(lines)
+.card {{
+    display: flex; align-items: center; gap: 44px;
+    background: var(--card); border: 2px solid var(--line);
+    border-radius: 36px; padding: 50px 50px;
+}}
+.card .num {{ font-size: 88px; font-weight: 700; color: var(--accent); min-width: 120px; letter-spacing: -2px; }}
+.card .circle {{
+    flex: none; width: 96px; height: 96px; border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #04121a; font-size: 48px; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+}}
+.card .body {{ flex: 1; min-width: 0; }}
+.card .row {{ display: flex; align-items: center; justify-content: space-between; gap: 20px; }}
+.card .t {{ font-size: 54px; font-weight: 700; line-height: 1.25; }}
+.card .d {{ font-size: 38px; font-weight: 500; color: var(--sub); margin-top: 16px; line-height: 1.4; }}
+.card .badge {{
+    flex: none; font-size: 32px; font-weight: 700; color: var(--accent);
+    border: 2px solid var(--accent); background: rgba(34,211,238,0.10);
+    padding: 12px 22px; border-radius: 16px;
+}}
+.steps .card {{ border-color: var(--line-soft); }}
 
-    # 텍스트 중앙 정렬 배치 (타이틀은 위, 설명은 아래)
-    draw.multiline_text((540, 820), wrap_text(title, font_title, 820), fill = (255,255,255,255), font = font_title, anchor = 'mm', align = 'center', spacing = 16)
-    draw.multiline_text((540, 1060), wrap_text(desc, font_desc, 820), fill = (220,225,235,255), font = font_desc, anchor = 'mm', align = 'center', spacing = 14)
+.stat {{
+    text-align: center; padding: 80px 40px; border-radius: 44px;
+    background: linear-gradient(160deg, rgba(34,211,238,0.14), rgba(56,189,248,0.03));
+    border: 2px solid var(--line);
+}}
+.stat .v {{ font-size: 136px; font-weight: 700; letter-spacing: -4px; color: var(--accent); line-height: 1.1; }}
+.stat .l {{ font-size: 46px; font-weight: 500; color: var(--sub); margin-top: 26px; }}
 
-    final_img = Image.alpha_composite(img, overlay).convert('RGB')
-    final_img.save(output_path)
+.cta {{
+    border-radius: 36px; padding: 52px 40px; text-align: center;
+    background: linear-gradient(120deg, var(--accent), var(--accent2));
+    box-shadow: 0 0 80px rgba(34,211,238,0.35);
+    color: #04121a;
+}}
+.cta .t {{ font-size: 58px; font-weight: 700; }}
+.cta .d {{ font-size: 38px; font-weight: 500; margin-top: 18px; opacity: 0.8; }}
 
+.tip {{
+    font-size: 38px; font-weight: 500; color: #fcd34d; text-align: center;
+    background: rgba(252,211,77,0.07); border: 2px solid rgba(252,211,77,0.25);
+    border-radius: 28px; padding: 34px 30px; line-height: 1.4;
+}}
+"""
+
+
+def _e(text):
+    return html.escape(str(text or '').strip())
+
+
+def _cards_html(items, numbered = 'num'):
+    parts = []
+    for i, item in enumerate(items[:3], start = 1):
+        if numbered == 'circle':
+            marker = f'<div class="circle">{i}</div>'
+        else:
+            marker = f'<div class="num">{i:02d}</div>'
+        badge = f'<div class="badge">{_e(item.get("badge"))}</div>' if _e(item.get('badge')) else ''
+        desc = f'<div class="d">{_e(item.get("desc"))}</div>' if _e(item.get('desc')) else ''
+        parts.append(
+            f'<div class="card">{marker}<div class="body">'
+            f'<div class="row"><div class="t">{_e(item.get("title"))}</div>{badge}</div>{desc}'
+            f'</div></div>'
+        )
+    return ''.join(parts)
+
+
+def build_scene_html(scene):
+    """씬 데이터(dict)를 레이아웃별 HTML 문자열로 변환"""
+    layout = scene.get('layout') if scene.get('layout') in LAYOUTS else 'cards'
+    items = scene.get('items') or []
+    kicker = f'<div class="kicker">{_e(scene.get("kicker"))}</div>' if _e(scene.get('kicker')) else ''
+    subtitle = _e(scene.get('subtitle'))
+    cta = ''
+    if _e(scene.get('cta_title')):
+        cta = (f'<div class="cta"><div class="t">{_e(scene.get("cta_title"))}</div>'
+               + (f'<div class="d">{_e(scene.get("cta_desc"))}</div>' if _e(scene.get('cta_desc')) else '')
+               + '</div>')
+    tip = f'<div class="tip">{_e(scene.get("tip"))}</div>' if _e(scene.get('tip')) else ''
+    bottom = cta or tip
+
+    if layout == 'hero':
+        body = (f'<div class="middle" style="gap:0">{kicker}'
+                f'<div class="title">{_e(scene.get("title"))}</div>'
+                + (f'<div class="subtitle">{subtitle}</div>' if subtitle else '')
+                + '</div>' + bottom)
+    elif layout == 'stat':
+        stat = (f'<div class="stat"><div class="v">{_e(scene.get("stat_value"))}</div>'
+                + (f'<div class="l">{_e(scene.get("stat_label"))}</div>' if _e(scene.get('stat_label')) else '')
+                + '</div>')
+        body = (f'{kicker}<div class="title">{_e(scene.get("title"))}</div>'
+                + (f'<div class="subtitle">{subtitle}</div>' if subtitle else '')
+                + f'<div class="middle">{stat}{_cards_html(items[:2])}</div>' + bottom)
+    elif layout == 'steps':
+        body = (f'<div class="title center">{_e(scene.get("title"))}</div>'
+                + (f'<div class="subtitle center">{subtitle}</div>' if subtitle else '')
+                + f'<div class="middle steps">{_cards_html(items, "circle")}</div>' + bottom)
+    elif layout == 'cta':
+        kicker = kicker.replace('class="kicker"', 'class="kicker" style="align-self:center"')
+        body = (f'<div class="middle" style="gap:0">{kicker}'
+                f'<div class="title center">{_e(scene.get("title"))}</div>'
+                + (f'<div class="subtitle center">{subtitle}</div>' if subtitle else '')
+                + '</div>' + (cta or tip))
+    else:  # cards
+        body = (f'{kicker}<div class="title">{_e(scene.get("title"))}</div>'
+                + (f'<div class="subtitle">{subtitle}</div>' if subtitle else '')
+                + f'<div class="middle">{_cards_html(items)}</div>' + bottom)
+
+    return f'<div class="frame">{body}</div>'
+
+
+def create_scene_visuals(scene, output_path):
+    """씬을 HTML 인포그래픽으로 그려 크롬으로 1080x1920 PNG 캡처"""
+    filename = os.path.basename(output_path)
+    hti.output_path = os.path.dirname(os.path.abspath(output_path))
+    hti.screenshot(
+        html_str = f'<!doctype html><html lang="ko"><head><meta charset="utf-8"></head>'
+                   f'<body>{build_scene_html(scene)}</body></html>',
+        css_str = BASE_CSS,
+        save_as = filename,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. 음성 + 영상 합성
+# ---------------------------------------------------------------------------
 def generate_scene_audio(text, output_path, max_retries = 5):
     """오디오 생성"""
     for attempt in range(max_retries):
@@ -150,36 +299,52 @@ def generate_scene_audio(text, output_path, max_retries = 5):
             print(e)
     raise Exception("Edge TTS 호출 최종 실패")
 
+
+def safe_filename(text):
+    """파일명에 쓸 수 없는 문자 제거"""
+    return re.sub(r'[\\/:*?"<>|\s]+', '_', text).strip('_') or 'shorts'
+
+
 def build_dynamic_shorts(keyword, script_data):
     """HTML 렌더링 이미지와 오디오를 클립 단위로 이어붙여 렌더링"""
     scenes = script_data['scenes']
+    name = safe_filename(keyword)
     video_clips = []
+    temp_files = []
 
-    for i, scene in enumerate(scenes):
-        audio_path = f"temp_{keyword}_scene{i}.mp3"
-        img_path = f"temp_{keyword}_scene{i}.png"
+    try:
+        for i, scene in enumerate(scenes):
+            audio_path = os.path.join(BASE_DIR, f"temp_{name}_scene{i}.mp3")
+            img_path = os.path.join(BASE_DIR, f"temp_{name}_scene{i}.png")
+            temp_files += [audio_path, img_path]
 
-        # 씬별 tts 생성
-        generate_scene_audio(scene['voice'], audio_path)
-        create_scene_visuals(scene['image_prompt'], scene['screen_title'], scene['screen_desc'], img_path)
+            # 씬별 tts + 인포그래픽 생성
+            generate_scene_audio(scene['voice'], audio_path)
+            create_scene_visuals(scene, img_path)
 
-        # 영상 합성
-        audio_clip = AudioFileClip(audio_path)
-        img_clip = ImageClip(img_path).set_duration(audio_clip.duration).set_audio(audio_clip)
-        video_clips.append(img_clip)
+            # 영상 합성 (음성 뒤에 0.4초 여유)
+            audio_clip = AudioFileClip(audio_path)
+            img_clip = ImageClip(img_path).set_duration(audio_clip.duration + 0.4).set_audio(audio_clip)
+            video_clips.append(img_clip)
 
-    final_video = concatenate_videoclips(video_clips, method = 'compose')
-    output_filename = f"{keyword}_숏폼최종(폴리네이션).mp4"
-    final_video.write_videofile(output_filename, fps = 24, codec = 'libx264', audio_codec = 'aac')
-   
-    for i in range(len(scenes)): 
-        try:
-            os.remove(f"temp_{keyword}_scene{i}.mp3")
-            os.remove(f"temp_{keyword}_scene{i}.png")
-        except:
-            pass
+        final_video = concatenate_videoclips(video_clips, method = 'compose')
+        output_filename = os.path.join(BASE_DIR, f"{name}_숏폼최종(인포그래픽).mp4")
+        final_video.write_videofile(output_filename, fps = 24, codec = 'libx264', audio_codec = 'aac')
+    finally:
+        for clip in video_clips:
+            try:
+                clip.audio.close()
+                clip.close()
+            except Exception:
+                pass
+        for path in temp_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     return output_filename
+
 
 @ app.route('/')
 def index():
@@ -188,17 +353,17 @@ def index():
 
 @ app.route('/generate', methods = ['POST'])
 def generate():
-    keyword = request.form.get('keyword')
+    keyword = (request.form.get('keyword') or '').strip()
     print(f"\n 키워드 : {keyword} - 렌더링 시작")
 
-    try : 
+    try :
         script_data = generate_dynamic_script_and_design(keyword)
         output_mp4 = build_dynamic_shorts(keyword, script_data)
 
         # 렌더링이 끝나면 브라우저를 통해 완성된 MP4 파일 즉시 다운로드
         return send_file(output_mp4, as_attachment = True)
-    
-    except Exception as e: 
+
+    except Exception as e:
         return f"렌더링 중 오류가 발생했습니다 : {e}", 500
 
 if __name__ == '__main__':
