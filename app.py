@@ -91,7 +91,7 @@ def generate_script_and_design(keyword, max_retries = 5):
     2. 시청자에게 직접 말을 건네는 구어체 내레이션만 쓰세요. 씬당 1~3문장.
     3. '청년고용연계자금' 같은 복합 명사는 TTS가 자연스럽게 읽도록 띄어쓰기하세요.(예시 : '청년 고용 연계 자금') 
 
-    [출력 형식]
+        [출력 형식]
     결과는 반드시 아래 구조의 JSON으로만 출력하세요. (Output must be in JSON)
     voice는 별도 배열로 모으지 말고, 반드시 각 씬 객체 안에 그 씬의 내레이션 문자열로 넣으세요.
     {{
@@ -256,7 +256,7 @@ def _cards_html(items, numbered = 'num'):
     return ''.join(parts)
 
 
-def build_scene_html(scene, current_year):
+def build_scene_html(scene):
     """씬 데이터(dict)를 레이아웃별 HTML 문자열로 변환"""
     raw_layout = scene.get('layout','list')
 
