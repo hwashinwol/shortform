@@ -10,10 +10,12 @@ from typing import List
 from pydantic import BaseModel
 from html2image import Html2Image
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from moviepy.editor import ImageClip, AudioFileClip, concatenate_videoclips
 from flask import Flask, render_template, request, send_file
+
+from typing import List, Optional
+from pydantic import BaseModel, Field
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WIDTH, HEIGHT = 1080, 1920
@@ -23,92 +25,120 @@ app = Flask(__name__)
 # app.py 와 같은 폴더의 .env 파일에서 API 키 읽기
 load_dotenv(os.path.join(BASE_DIR, '.env'))
 
-gemini_api_key = os.environ.get('GEMINI_API_KEY', '').strip()
-if not gemini_api_key:
-    raise SystemExit('GEMINI_API_KEY가 없습니다. shortform 폴더의 .env 파일을 확인하세요.')
-client = genai.Client(api_key = gemini_api_key)
+openai_api_key = os.environ.get('OPENAI_API_KEY','').strip()
+if not openai_api_key:
+    raise SystemExit('OPENAI_API_KEY가 없습니다. shortform 폴더의 .env 파일을 확인하세요.')
+client = OpenAI(api_key = openai_api_key)
 
 # 크롬 스크린샷 도구 초기화 (HTML 씬을 1080x1920 PNG로 캡처)
 hti = Html2Image(size = (WIDTH, HEIGHT), output_path = BASE_DIR)
 
 
-# ---------------------------------------------------------------------------
-# 1. Gemini : 대본 + 씬별 레이아웃/내용 생성
-#    (디자인은 아래 고정 CSS 템플릿이 담당하고, Gemini는 레이아웃 종류와 문구만 고른다)
-# ---------------------------------------------------------------------------
 LAYOUTS = ('hero', 'cards', 'steps', 'stat', 'cta')
 
 class Item(BaseModel):
-    title: str
-    desc: str
-    badge: str
+    title: Optional[str] = ""
+    desc: Optional[str] = ""
+    badge: Optional[str] = ""
 
 class Scene(BaseModel):
     layout: str      # hero | cards | steps | stat | cta
-    kicker: str      # 타이틀 위 작은 라벨 (없으면 "")
-    title: str
-    subtitle: str
-    items: List[Item]
-    stat_value: str  # stat 레이아웃의 큰 숫자 (예 : 7천만 원)
-    stat_label: str
-    cta_title: str   # 하단 강조 버튼 (없으면 "")
-    cta_desc: str
-    tip: str         # 하단 한 줄 팁 (없으면 "")
+    kicker: str = ""    # 타이틀 위 작은 라벨 (없으면 "")
+    title: str = ""
+    subtitle: str = ""
+    items: List[Item] = Field(default_factory = list)
+    stat_value: str = "" # stat 레이아웃의 큰 숫자 (예 : 7천만 원)
+    stat_label: str = ""
+    cta_title: str = ""  # 하단 강조 버튼 (없으면 "")
+    cta_desc: str = ""
+    tip: str = ""        # 하단 한 줄 팁 (없으면 "")
     voice: str
 
 class Script(BaseModel):
     scenes: List[Scene]
 
-
-def generate_dynamic_script_and_design(keyword, max_retries = 5):
-    """LLM이 대본과 씬별 인포그래픽 구성(레이아웃 + 문구)을 생성하여 반환"""
+# ---------------------------------------------------------------------------
+# 1. GPT : 대본 + 씬별 레이아웃/내용 생성
+# ---------------------------------------------------------------------------
+def generate_script_and_design(keyword, max_retries = 5):
+    """GPT-4o를 사용하여 HTML 코드와 대본(JSON)을 생성하는 모듈.
+    """
     current_year = datetime.datetime.now().year
     system_instruction = f"""
-    당신은 정책자금/지원금 정보를 다루는 숏폼 인포그래픽 기획자입니다.
-    현재 연도는 {current_year}년입니다. 연도가 들어갈 경우 반드시 {current_year}년을 반영하세요.
+    당신은 숏폼 인포그래픽 디자이너이자 기획자입니다. 
+    현재 연도는 {current_year}년입니다. 연도가 들어갈 경우 반드시 {current_year}년을 반영하세요. 
     주어진 주제를 4~6개의 씬으로 나누고, 씬마다 아래 레이아웃 중 하나를 골라 화면 문구를 채웁니다.
 
     [레이아웃 종류]
-    - hero  : 첫 씬 전용. kicker(예 : {current_year} 정책자금), 큰 title, subtitle. items는 비움.
-    - cards : 핵심 혜택/조건 정리. items 2~3개(title, desc, badge 모두 채움).
-    - steps : 신청 절차. items 3개(title=단계명, desc=구체적 행동, badge=""). 필요하면 cta_title/cta_desc.
-    - stat  : 한도/금리 같은 핵심 숫자 강조. stat_value(예 : 최대 7천만 원), stat_label, items 0~2개.
-    - cta   : 마지막 씬. title, subtitle, cta_title(행동 유도 문구), cta_desc.
-    첫 씬은 hero, 마지막 씬은 cta로 하고, 중간 씬은 같은 레이아웃이 연속되지 않게 섞으세요.
-
+    - intro : 첫 씬 전용. 시청자의 시선을 끄는 Hooking 용도. kicker(예 : 주제 분류/채널명), 메인 title, subtitle로 구성. items는 비움.
+    - list : 병렬적인 정보(특징, 종류, 장단점, top3 등)를 나열할 때 사용. items 2~3개 활용(title, desc, 필요시 badge).
+    - sequence : 순서, 흐름, 타임라인, 인과관계(기승전결)를 설명할 때 사용. items 3개 활용(title = 단계/시점, desc = 내용).
+    - highlight : 결정적인 키워드, 핵심 문장, 충격적인 숫자나 통계 하나를 화면 중앙에 크게 띄워 강조할 때 사용. stat_value(강조할 텍스트/숫자), stat_label(부연 설명), items는 0~1개.
+    - outro : 마지막 씬 전용. 전체 요약이나 행동 유도. title, subtitle, cta_title(예 : 구독/좋아요/공유 유도), cta_desc.
+    
+    [레이아웃 배치 규칙]
+    - 첫 씬은 반드시 'intro', 마지막 씬은 반드시 'outro'로 고정하세요.
+    - 중간 씬들은 텍스트의 맥락(나열, 순서 강조)에 맞춰 'list','sequence','highlight' 중 가장 적합한 레이아웃을 스스로 판단하여 선택하되, 시각적으로 지루하지 않게 서로 다른 레이아웃을 교차 배치하세요.
+    
     [화면 문구 규칙]
-    1. title은 14자 이내, subtitle은 24자 이내, item title은 14자 이내, item desc는 26자 이내, badge는 6자 이내.
+    1. title은 14자 이내, subtitle은 24자 이내, items는 15~25자, badge는 6자 이내.
     2. 문구는 명사형으로 짧게 끝내고 큰따옴표나 이모지는 쓰지 마세요.
-    3. 쓰지 않는 필드는 빈 문자열 "" 또는 빈 배열 []로 두세요.
-    4. 확실하지 않은 수치는 지어내지 말고 "공고 확인" 처럼 표현하세요.
+    3. 쓰지 않는 필드는 빈 문자열 ""또는 빈 배열 []로 두세요.
+    4. 확실하지 않은 수치는 지어내지 말고 "공고 확인"처럼 표현하세요.
 
     [TTS 대본(voice) 작성 규칙]
     1. "첫 번째 씬에서는~", "이 화면은 ~을 설명합니다" 같은 상황 설명이나 지시문은 절대 넣지 마세요.
     2. 시청자에게 직접 말을 건네는 구어체 내레이션만 쓰세요. 씬당 1~3문장.
-    3. '청년고용연계자금' 같은 복합 명사는 TTS가 자연스럽게 읽도록 띄어쓰기하세요.(예 : '청년 고용 연계 자금')
+    3. '청년고용연계자금' 같은 복합 명사는 TTS가 자연스럽게 읽도록 띄어쓰기하세요.(예시 : '청년 고용 연계 자금') 
+
+    [출력 형식]
+    결과는 반드시 아래 구조의 JSON으로만 출력하세요. (Output must be in JSON)
+    voice는 별도 배열로 모으지 말고, 반드시 각 씬 객체 안에 그 씬의 내레이션 문자열로 넣으세요.
+    {{
+      "scenes": [
+        {{
+          "layout": "intro",
+          "kicker": "",
+          "title": "",
+          "subtitle": "",
+          "items": [{{"title": "", "desc": "", "badge": ""}}],
+          "stat_value": "",
+          "stat_label": "",
+          "cta_title": "",
+          "cta_desc": "",
+          "tip": "",
+          "voice": "이 씬의 내레이션"
+        }}
+      ]
+    }}
+
     """
 
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(
-                model = 'gemini-3.8-flash',
-                contents = f"주제 : {keyword}",
-                config = types.GenerateContentConfig(
-                    system_instruction = system_instruction,
-                    response_mime_type = 'application/json',
-                    response_schema = Script,
-                )
+            response = client.chat.completions.create(
+                model = 'gpt-4o',
+                messages = [
+                    {'role':'system','content':system_instruction},
+                    {'role':'user','content':f'주제 : {keyword}'}
+                ],
+                response_format = {'type' : 'json_object'}
             )
-            script = response.parsed
-            if script is None:
-                script = Script.model_validate_json(response.text)
+
+            raw_text = response.choices[0].message.content
+            script = Script.model_validate_json(raw_text)
+
+
             if not script.scenes:
                 raise ValueError('씬이 비어 있습니다')
             return script.model_dump()
+        
         except Exception as e:
-            print(f"Gemini 호출 실패, 3초 후 재시도 ({attempt+1}/{max_retries}) : {e}")
+            print(f"GPT-4o 호출 실패, 3초 후 재시도 ({attempt + 1}/{max_retries}) : {e}")
+            import time
             time.sleep(3)
-    raise Exception('Gemini API 호출 실패')
+
+    raise Exception('GPT-4o API 호출 실패')
 
 
 # ---------------------------------------------------------------------------
@@ -226,13 +256,25 @@ def _cards_html(items, numbered = 'num'):
     return ''.join(parts)
 
 
-def build_scene_html(scene):
+def build_scene_html(scene, current_year):
     """씬 데이터(dict)를 레이아웃별 HTML 문자열로 변환"""
-    layout = scene.get('layout') if scene.get('layout') in LAYOUTS else 'cards'
+    raw_layout = scene.get('layout','list')
+
+    layout_map = {
+        'intro' : 'hero',
+        'highlight' : 'stat',
+        'sequence' : 'steps',
+        'outro' : 'cta',
+        'list' : 'cards',
+    }
+
+    layout = layout_map.get(raw_layout, raw_layout)
+
     items = scene.get('items') or []
     kicker = f'<div class="kicker">{_e(scene.get("kicker"))}</div>' if _e(scene.get('kicker')) else ''
     subtitle = _e(scene.get('subtitle'))
     cta = ''
+
     if _e(scene.get('cta_title')):
         cta = (f'<div class="cta"><div class="t">{_e(scene.get("cta_title"))}</div>'
                + (f'<div class="d">{_e(scene.get("cta_desc"))}</div>' if _e(scene.get('cta_desc')) else '')
@@ -357,7 +399,7 @@ def generate():
     print(f"\n 키워드 : {keyword} - 렌더링 시작")
 
     try :
-        script_data = generate_dynamic_script_and_design(keyword)
+        script_data = generate_script_and_design(keyword)
         output_mp4 = build_dynamic_shorts(keyword, script_data)
 
         # 렌더링이 끝나면 브라우저를 통해 완성된 MP4 파일 즉시 다운로드
